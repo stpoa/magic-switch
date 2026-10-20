@@ -167,6 +167,57 @@ final class NetworkDeviceStore: ObservableObject, NetworkDeviceManageable {
     saveNetworkDevices()
   }
 
+  /// Registers or associates a discovered Bluetooth LE peer Mac with existing records.
+  func registerDiscoveredBluetoothPeer(
+    identifier: UUID,
+    name: String,
+    fingerprint: String?
+  ) {
+    // 1. If we already have a registered device with this name or fingerprint, associate it
+    if let index = networkDevices.firstIndex(where: {
+      $0.name.caseInsensitiveCompare(name) == .orderedSame
+        || ($0.fingerprint != nil && $0.fingerprint == fingerprint)
+    }) {
+      networkDevices[index].bluetoothID = identifier
+      if networkDevices[index].fingerprint == nil, let fp = fingerprint {
+        networkDevices[index].fingerprint = fp
+      }
+      deviceReachability[networkDevices[index].id] = true
+      saveNetworkDevices()
+      Log.network.notice(
+        "Associated Bluetooth peer '\(name)' (\(identifier)) with registered device '\(networkDevices[index].name)'"
+      )
+      return
+    }
+
+    // 2. If already in discovered devices, update it
+    if let index = discoveredNetworkDevices.firstIndex(where: {
+      $0.name.caseInsensitiveCompare(name) == .orderedSame
+        || ($0.fingerprint != nil && $0.fingerprint == fingerprint)
+    }) {
+      discoveredNetworkDevices[index].bluetoothID = identifier
+      if discoveredNetworkDevices[index].fingerprint == nil, let fp = fingerprint {
+        discoveredNetworkDevices[index].fingerprint = fp
+      }
+      discoveredNetworkDevices[index].isActive = true
+      return
+    }
+
+    // 3. Otherwise add as a newly discovered peer over Bluetooth
+    let newDevice = NetworkDevice(
+      id: name,
+      name: name,
+      host: "",
+      port: 0,
+      isActive: true,
+      fingerprint: fingerprint,
+      bluetoothID: identifier
+    )
+    discoveredNetworkDevices.append(newDevice)
+    deviceReachability[newDevice.id] = true
+    Log.network.notice("Discovered new peer '\(name)' over Bluetooth (\(identifier))")
+  }
+
   func updateNetworkDevice(_ device: NetworkDevice) {
     updateNetworkDevice(device, proven: false)
   }
@@ -1059,8 +1110,7 @@ extension NetworkDeviceStore {
     default: bodyTimeout = 5
     }
     let outgoing = OutgoingConnection(
-      host: device.host,
-      port: UInt16(device.port),
+      device: device,
       countsTowardRateLimit: countsTowardRateLimit,
       bodyTimeout: bodyTimeout
     )
@@ -1099,7 +1149,7 @@ extension NetworkDeviceStore {
       return
     }
 
-    let outgoing = OutgoingConnection(host: device.host, port: UInt16(device.port))
+    let outgoing = OutgoingConnection(device: device)
     outgoing.run(
       body: { channel, done in
         channel.send(Data(DeviceCommand.notification.rawValue.utf8)) { err in
@@ -1162,7 +1212,7 @@ extension NetworkDeviceStore {
     }
 
     beginOperation(.sync(count: peripherals.count), for: device.id)
-    let outgoing = OutgoingConnection(host: device.host, port: UInt16(device.port))
+    let outgoing = OutgoingConnection(device: device)
     outgoing.run(
       body: { channel, done in
         channel.send(Data(DeviceCommand.syncPeripherals.rawValue.utf8)) { err in
@@ -1275,12 +1325,11 @@ extension NetworkDeviceStore {
       completion(.failure(.notPaired))
       return
     }
-    guard let local = servicePublisher.currentIdentity() else {
-      completion(.failure(.connectionFailed("listener not ready")))
-      return
-    }
+    let local =
+      servicePublisher.currentIdentity()
+      ?? IntroducedIdentity(name: Host.current().localizedName ?? "Mac", port: 0)
     let outgoing = OutgoingConnection(
-      host: device.host, port: UInt16(device.port),
+      device: device,
       countsTowardRateLimit: countsTowardRateLimit)
     var reply: IntroduceReply?
     outgoing.run(
@@ -1419,7 +1468,7 @@ extension NetworkDeviceStore {
     default: bodyTimeout = 5
     }
     let outgoing = OutgoingConnection(
-      host: device.host, port: UInt16(device.port),
+      device: device,
       countsTowardRateLimit: countsTowardRateLimit,
       bodyTimeout: bodyTimeout)
     outgoing.run(
