@@ -25,6 +25,7 @@ protocol TransportConnection: AnyObject {
 final class ByteStreamBuffer {
   private var buffer = Data()
   private var pendingRead: (count: Int, completion: (Result<Data, Error>) -> Void)?
+  private var terminalError: Error?
   private let queue: DispatchQueue
 
   init(queue: DispatchQueue = DispatchQueue(label: "com.magicswitch.bytestreambuffer")) {
@@ -34,6 +35,7 @@ final class ByteStreamBuffer {
   /// Appends newly arrived chunk bytes to the buffer and fulfills any pending read.
   func append(_ data: Data) {
     queue.async {
+      guard self.terminalError == nil else { return }
       self.buffer.append(data)
       self.flush()
     }
@@ -43,6 +45,10 @@ final class ByteStreamBuffer {
   /// otherwise holds the request until enough bytes have been appended.
   func read(exact count: Int, completion: @escaping (Result<Data, Error>) -> Void) {
     queue.async {
+      if let error = self.terminalError {
+        completion(.failure(error))
+        return
+      }
       guard self.pendingRead == nil else {
         completion(.failure(SecureChannelError.framingFailed))
         return
@@ -55,6 +61,7 @@ final class ByteStreamBuffer {
   /// Fails any pending read with an error and clears the buffer (used on teardown).
   func fail(error: Error) {
     queue.async {
+      self.terminalError = error
       if let pending = self.pendingRead {
         self.pendingRead = nil
         pending.completion(.failure(error))

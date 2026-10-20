@@ -117,6 +117,7 @@ final class BLETransportConnection: NSObject, TransportConnection {
         self.sendCompletion = nil
         sendComp(BLETransportError.disconnected)
       }
+      self.pendingChunks.removeAll()
       self.onCancel?()
     }
   }
