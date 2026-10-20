@@ -328,7 +328,8 @@ final class OutgoingConnection {
       return
     }
 
-    BLETransportManager.shared.connect(to: btID) { [weak self] result in
+    let connectTimeout = max(MagicSwitchBLE.bleConnectTimeout, bodyTimeout)
+    BLETransportManager.shared.connect(to: btID, timeout: connectTimeout) { [weak self] result in
       guard let self = self else { return }
       switch result {
       case .failure(let error):

@@ -30,6 +30,16 @@ final class BLETransportManager: NSObject, ObservableObject {
   private var pendingClientConnects: [UUID: (Result<BLETransportConnection, Error>) -> Void] = [:]
   private var discoveryTimer: DispatchSourceTimer?
 
+  // Queued outgoing client connection requests per peer (to serialize BLE access)
+  private struct QueuedClientRequest {
+    let id: UUID
+    let timeout: TimeInterval
+    let completion: (Result<BLETransportConnection, Error>) -> Void
+  }
+
+  private var queuedClientRequests: [UUID: [QueuedClientRequest]] = [:]
+  private var queueTimers: [UUID: DispatchSourceTimer] = [:]
+
   // MARK: - Lifecycle
 
   func start() {
@@ -53,7 +63,16 @@ final class BLETransportManager: NSObject, ObservableObject {
     discoveryTimer?.cancel()
     discoveryTimer = nil
     centralQueue.async { [weak self] in
-      self?.centralManager?.stopScan()
+      guard let self = self else { return }
+      for (_, timer) in self.queueTimers {
+        timer.cancel()
+      }
+      self.queueTimers.removeAll()
+      for (_, requests) in self.queuedClientRequests {
+        requests.forEach { $0.completion(.failure(BLETransportError.disconnected)) }
+      }
+      self.queuedClientRequests.removeAll()
+      self.centralManager?.stopScan()
     }
     peripheralQueue.async { [weak self] in
       self?.peripheralManager?.stopAdvertising()
@@ -170,6 +189,21 @@ final class BLETransportManager: NSObject, ObservableObject {
         return
       }
 
+      // If this peer already has an active client connection or a connect in flight, serialize by queueing
+      if self.activeClientConnections[peripheralIdentifier] != nil
+        || self.pendingClientConnects[peripheralIdentifier] != nil
+      {
+        Log.network.notice(
+          "BLETransportManager: peer \(peripheralIdentifier) is busy; queueing request (timeout \(timeout)s)"
+        )
+        self.enqueueClientRequest(
+          peripheralIdentifier: peripheralIdentifier,
+          timeout: timeout,
+          completion: completion
+        )
+        return
+      }
+
       // Check if peripheral is connected and characteristics are ready and notifying
       if peripheral.state == .connected,
         let service = peripheral.services?.first(where: { $0.uuid == MagicSwitchBLE.serviceUUID }),
@@ -202,9 +236,70 @@ final class BLETransportManager: NSObject, ObservableObject {
       self.centralQueue.asyncAfter(deadline: .now() + timeout) {
         if let pending = self.pendingClientConnects.removeValue(forKey: peripheralIdentifier) {
           pending(.failure(BLETransportError.timeout))
+          self.processNextQueuedClientRequest(for: peripheralIdentifier)
         }
       }
     }
+  }
+
+  private func enqueueClientRequest(
+    peripheralIdentifier: UUID,
+    timeout: TimeInterval,
+    completion: @escaping (Result<BLETransportConnection, Error>) -> Void
+  ) {
+    let reqID = UUID()
+    let timer = DispatchSource.makeTimerSource(queue: centralQueue)
+    timer.schedule(deadline: .now() + timeout)
+    timer.setEventHandler { [weak self] in
+      guard let self = self else { return }
+      if var list = self.queuedClientRequests[peripheralIdentifier] {
+        if let idx = list.firstIndex(where: { $0.id == reqID }) {
+          let req = list.remove(at: idx)
+          self.queuedClientRequests[peripheralIdentifier] = list.isEmpty ? nil : list
+          self.queueTimers.removeValue(forKey: reqID)?.cancel()
+          Log.network.notice(
+            "BLETransportManager: queued request for \(peripheralIdentifier) timed out"
+          )
+          req.completion(.failure(BLETransportError.timeout))
+        }
+      }
+    }
+    timer.resume()
+    queueTimers[reqID] = timer
+
+    let request = QueuedClientRequest(
+      id: reqID,
+      timeout: timeout,
+      completion: { [weak self] result in
+        self?.centralQueue.async {
+          self?.queueTimers.removeValue(forKey: reqID)?.cancel()
+        }
+        completion(result)
+      }
+    )
+    queuedClientRequests[peripheralIdentifier, default: []].append(request)
+  }
+
+  private func processNextQueuedClientRequest(for peripheralIdentifier: UUID) {
+    // Only process if no active connection and no connect in flight
+    guard activeClientConnections[peripheralIdentifier] == nil,
+      pendingClientConnects[peripheralIdentifier] == nil
+    else { return }
+
+    guard var list = queuedClientRequests[peripheralIdentifier], !list.isEmpty else {
+      queuedClientRequests.removeValue(forKey: peripheralIdentifier)
+      return
+    }
+
+    let next = list.removeFirst()
+    queuedClientRequests[peripheralIdentifier] = list.isEmpty ? nil : list
+    queueTimers.removeValue(forKey: next.id)?.cancel()
+
+    Log.network.notice(
+      "BLETransportManager: processing queued client request for \(peripheralIdentifier) (\(list.count) remaining)"
+    )
+
+    connect(to: peripheralIdentifier, timeout: next.timeout, completion: next.completion)
   }
 
   private func establishClientConnection(
@@ -227,6 +322,7 @@ final class BLETransportManager: NSObject, ObservableObject {
         if self?.activeClientConnections[peripheralIdentifier] === connection {
           self?.activeClientConnections.removeValue(forKey: peripheralIdentifier)
         }
+        self?.processNextQueuedClientRequest(for: peripheralIdentifier)
       }
     }
     self.activeClientConnections[peripheralIdentifier] = connection
@@ -528,6 +624,12 @@ extension BLETransportManager: CBCentralManagerDelegate {
     }
     if let pending = pendingClientConnects.removeValue(forKey: peripheral.identifier) {
       pending(.failure(BLETransportError.disconnected))
+    }
+    if let queued = queuedClientRequests.removeValue(forKey: peripheral.identifier) {
+      for req in queued {
+        queueTimers.removeValue(forKey: req.id)?.cancel()
+        req.completion(.failure(BLETransportError.disconnected))
+      }
     }
   }
 }
