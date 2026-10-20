@@ -13,6 +13,13 @@ enum BLETransportError: Error {
 /// A `TransportConnection` operating over CoreBluetooth.
 /// Bridges a Bluetooth Low Energy link into a reliable stream for `SecureChannel`.
 final class BLETransportConnection: NSObject, TransportConnection {
+  // MARK: - Types
+
+  private struct SendTask {
+    var chunks: [Data]
+    let completion: (Error?) -> Void
+  }
+
   // MARK: - Properties
 
   private let byteStreamBuffer: ByteStreamBuffer
@@ -22,15 +29,15 @@ final class BLETransportConnection: NSObject, TransportConnection {
   // Central-side properties
   private weak var peripheral: CBPeripheral?
   private var commandCharacteristic: CBCharacteristic?
+  private var sendQueue: [SendTask] = []
+  private var isSending = false
 
   // Peripheral-side properties
   private weak var central: CBCentral?
   private weak var peripheralManager: CBPeripheralManager?
   private var responseCharacteristic: CBMutableCharacteristic?
-
-  // Send queue state for Central writes
-  private var sendCompletion: ((Error?) -> Void)?
-  private var pendingChunks: [Data] = []
+  private var peripheralSendQueue: [SendTask] = []
+  private var isPeripheralSending = false
 
   /// Invoked when the transport connection is cancelled and torn down.
   var onCancel: (() -> Void)?
@@ -80,6 +87,26 @@ final class BLETransportConnection: NSObject, TransportConnection {
     byteStreamBuffer.append(data)
   }
 
+  // MARK: - Session Control (Central Role)
+
+  /// Sends session start control magic to the peripheral before exchanging stream frames.
+  func startSession(completion: @escaping (Error?) -> Void) {
+    queue.async {
+      guard self.isConnected, self.peripheral != nil,
+        self.commandCharacteristic != nil
+      else {
+        completion(BLETransportError.notConnected)
+        return
+      }
+      let task = SendTask(chunks: [MagicSwitchBLE.sessionStartMagic], completion: completion)
+      self.sendQueue.append(task)
+      if !self.isSending {
+        self.isSending = true
+        self.sendNextCentralChunk()
+      }
+    }
+  }
+
   // MARK: - TransportConnection Implementation
 
   func send(data: Data, completion: @escaping (Error?) -> Void) {
@@ -112,17 +139,22 @@ final class BLETransportConnection: NSObject, TransportConnection {
     queue.async {
       guard !self.isCancelled else { return }
       self.isCancelled = true
-      self.byteStreamBuffer.fail(error: SecureChannelError.connectionClosed)
-      if let sendComp = self.sendCompletion {
-        self.sendCompletion = nil
-        sendComp(BLETransportError.disconnected)
+
+      // Inform peripheral that session has ended so it can tear down immediately
+      if let peripheral = self.peripheral, let char = self.commandCharacteristic,
+        peripheral.state == .connected
+      {
+        peripheral.writeValue(MagicSwitchBLE.sessionEndMagic, for: char, type: .withoutResponse)
       }
-      self.pendingChunks.removeAll()
+
+      self.byteStreamBuffer.fail(error: SecureChannelError.connectionClosed)
+      self.drainCentralQueue(error: BLETransportError.disconnected)
+      self.drainPeripheralQueue(error: BLETransportError.disconnected)
       self.onCancel?()
     }
   }
 
-  // MARK: - Central Sending (Chunked Write with Response)
+  // MARK: - Central Sending (Chunked Write with Response Queue)
 
   private func sendAsCentral(
     data: Data,
@@ -140,45 +172,59 @@ final class BLETransportConnection: NSObject, TransportConnection {
       offset += length
     }
 
-    self.pendingChunks = chunks
-    self.sendCompletion = completion
-    self.sendNextCentralChunk()
+    let task = SendTask(chunks: chunks, completion: completion)
+    sendQueue.append(task)
+    if !isSending {
+      isSending = true
+      sendNextCentralChunk()
+    }
   }
 
   private func sendNextCentralChunk() {
+    guard !isCancelled else {
+      drainCentralQueue(error: BLETransportError.disconnected)
+      return
+    }
+
     guard let peripheral = peripheral, let char = commandCharacteristic else {
-      let comp = sendCompletion
-      sendCompletion = nil
-      comp?(BLETransportError.disconnected)
+      drainCentralQueue(error: BLETransportError.disconnected)
       return
     }
 
-    guard !pendingChunks.isEmpty else {
-      let comp = sendCompletion
-      sendCompletion = nil
-      comp?(nil)
+    while !sendQueue.isEmpty {
+      if sendQueue[0].chunks.isEmpty {
+        let task = sendQueue.removeFirst()
+        task.completion(nil)
+        continue
+      }
+
+      let chunk = sendQueue[0].chunks.removeFirst()
+      peripheral.writeValue(chunk, for: char, type: .withResponse)
       return
     }
 
-    let chunk = pendingChunks.removeFirst()
-    peripheral.writeValue(chunk, for: char, type: .withResponse)
+    isSending = false
   }
 
   /// Called by the peripheral delegate when a chunk write completes.
   func handleDidWriteValue(error: Error?) {
     queue.async {
       if let error = error {
-        let comp = self.sendCompletion
-        self.sendCompletion = nil
-        self.pendingChunks.removeAll()
-        comp?(error)
+        self.drainCentralQueue(error: error)
         return
       }
       self.sendNextCentralChunk()
     }
   }
 
-  // MARK: - Peripheral Sending (Chunked Notification)
+  private func drainCentralQueue(error: Error) {
+    let tasks = sendQueue
+    sendQueue.removeAll()
+    isSending = false
+    tasks.forEach { $0.completion(error) }
+  }
+
+  // MARK: - Peripheral Sending (Chunked Notification Queue)
 
   private func sendAsPeripheral(
     data: Data,
@@ -198,34 +244,37 @@ final class BLETransportConnection: NSObject, TransportConnection {
       offset += length
     }
 
-    self.pendingChunks = chunks
-    self.sendCompletion = completion
-    self.sendNextPeripheralChunk()
+    let task = SendTask(chunks: chunks, completion: completion)
+    peripheralSendQueue.append(task)
+    if !isPeripheralSending {
+      isPeripheralSending = true
+      sendNextPeripheralChunk()
+    }
   }
 
   func sendNextPeripheralChunk() {
     queue.async {
       guard !self.isCancelled else {
-        let comp = self.sendCompletion
-        self.sendCompletion = nil
-        self.pendingChunks.removeAll()
-        comp?(BLETransportError.disconnected)
+        self.drainPeripheralQueue(error: BLETransportError.disconnected)
         return
       }
 
       guard let manager = self.peripheralManager, let char = self.responseCharacteristic else {
-        let comp = self.sendCompletion
-        self.sendCompletion = nil
-        self.pendingChunks.removeAll()
-        comp?(BLETransportError.notConnected)
+        self.drainPeripheralQueue(error: BLETransportError.notConnected)
         return
       }
 
-      while !self.pendingChunks.isEmpty {
-        let chunk = self.pendingChunks[0]
+      while !self.peripheralSendQueue.isEmpty {
+        if self.peripheralSendQueue[0].chunks.isEmpty {
+          let task = self.peripheralSendQueue.removeFirst()
+          task.completion(nil)
+          continue
+        }
+
+        let chunk = self.peripheralSendQueue[0].chunks[0]
         let sent = manager.updateValue(chunk, for: char, onSubscribedCentrals: nil)
         if sent {
-          self.pendingChunks.removeFirst()
+          self.peripheralSendQueue[0].chunks.removeFirst()
         } else {
           // Transmit buffer full or central subscription still pending.
           // Retry automatically after a short interval or when peripheralManagerIsReady fires.
@@ -236,10 +285,15 @@ final class BLETransportConnection: NSObject, TransportConnection {
         }
       }
 
-      let comp = self.sendCompletion
-      self.sendCompletion = nil
-      comp?(nil)
+      self.isPeripheralSending = false
     }
+  }
+
+  private func drainPeripheralQueue(error: Error) {
+    let tasks = peripheralSendQueue
+    peripheralSendQueue.removeAll()
+    isPeripheralSending = false
+    tasks.forEach { $0.completion(error) }
   }
 
   /// Called when the peripheral manager's transmit queue has freed up.

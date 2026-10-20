@@ -181,24 +181,11 @@ final class BLETransportManager: NSObject, ObservableObject {
         }),
         responseChar.isNotifying
       {
-        if let old = self.activeClientConnections[peripheralIdentifier] {
-          old.cancel()
-        }
-
-        let connection = BLETransportConnection(
+        self.establishClientConnection(
           peripheral: peripheral,
-          commandCharacteristic: commandChar,
-          queue: self.centralQueue
+          commandChar: commandChar,
+          completion: completion
         )
-        connection.onCancel = { [weak self] in
-          self?.centralQueue.async {
-            if self?.activeClientConnections[peripheralIdentifier] === connection {
-              self?.activeClientConnections.removeValue(forKey: peripheralIdentifier)
-            }
-          }
-        }
-        self.activeClientConnections[peripheralIdentifier] = connection
-        completion(.success(connection))
         return
       }
 
@@ -215,6 +202,42 @@ final class BLETransportManager: NSObject, ObservableObject {
       self.centralQueue.asyncAfter(deadline: .now() + timeout) {
         if let pending = self.pendingClientConnects.removeValue(forKey: peripheralIdentifier) {
           pending(.failure(BLETransportError.timeout))
+        }
+      }
+    }
+  }
+
+  private func establishClientConnection(
+    peripheral: CBPeripheral,
+    commandChar: CBCharacteristic,
+    completion: @escaping (Result<BLETransportConnection, Error>) -> Void
+  ) {
+    let peripheralIdentifier = peripheral.identifier
+    if let old = self.activeClientConnections[peripheralIdentifier] {
+      old.cancel()
+    }
+
+    let connection = BLETransportConnection(
+      peripheral: peripheral,
+      commandCharacteristic: commandChar,
+      queue: centralQueue
+    )
+    connection.onCancel = { [weak self] in
+      self?.centralQueue.async {
+        if self?.activeClientConnections[peripheralIdentifier] === connection {
+          self?.activeClientConnections.removeValue(forKey: peripheralIdentifier)
+        }
+      }
+    }
+    self.activeClientConnections[peripheralIdentifier] = connection
+
+    connection.startSession { [weak self] error in
+      self?.centralQueue.async {
+        if let error = error {
+          connection.cancel()
+          completion(.failure(error))
+        } else {
+          completion(.success(connection))
         }
       }
     }
@@ -347,61 +370,74 @@ extension BLETransportManager: CBPeripheralManagerDelegate {
       }
 
       let centralID = request.central.identifier
-      var connection = activeServerConnections[centralID]
+      let connection = activeServerConnections[centralID]
 
-      // Detect if this incoming packet is the start of a new handshake session.
-      // Handshake packet 1 is cleartext: 4-byte big-endian UInt32(32) followed by 32 bytes of nonce.
-      let isHandshakeStart =
-        data.count >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 32
-
-      if isHandshakeStart || connection == nil || connection?.isConnected == false,
-        let responseChar = responseCharacteristic
-      {
+      if data == MagicSwitchBLE.sessionStartMagic {
         if let oldConn = connection {
           Log.network.notice(
-            "BLETransportManager: resetting previous server session for \(centralID) on new handshake"
+            "BLETransportManager: resetting previous server session for \(centralID) on sessionStartMagic"
           )
           oldConn.cancel()
         }
 
-        // Create new incoming connection session
-        let newConn = BLETransportConnection(
-          central: request.central,
-          peripheralManager: peripheral,
-          responseCharacteristic: responseChar,
-          queue: peripheralQueue
-        )
-        newConn.onCancel = { [weak self] in
-          self?.peripheralQueue.async {
-            if self?.activeServerConnections[centralID] === newConn {
-              self?.activeServerConnections.removeValue(forKey: centralID)
+        if let responseChar = responseCharacteristic {
+          let newConn = BLETransportConnection(
+            central: request.central,
+            peripheralManager: peripheral,
+            responseCharacteristic: responseChar,
+            queue: peripheralQueue
+          )
+          newConn.onCancel = { [weak self] in
+            self?.peripheralQueue.async {
+              if self?.activeServerConnections[centralID] === newConn {
+                self?.activeServerConnections.removeValue(forKey: centralID)
+              }
             }
           }
-        }
-        activeServerConnections[centralID] = newConn
-        connection = newConn
+          activeServerConnections[centralID] = newConn
 
-        // Spawn IncomingConnection to handle mutual handshake and commands
-        DispatchQueue.main.async { [weak self] in
-          guard let self = self else { return }
-          let incoming = IncomingConnection(
-            transport: newConn,
-            endpointDesc: "Bluetooth (\(centralID))",
-            rateLimiter: self.rateLimiter,
-            pairingStore: PairingStore.shared,
-            queue: DispatchQueue(label: "com.magicswitch.ble.incoming.\(centralID)"),
-            localIdentity: {
-              IntroducedIdentity(
-                name: Host.current().localizedName ?? "Mac",
-                port: 0
-              )
-            }
-          )
-          incoming.start()
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let incoming = IncomingConnection(
+              transport: newConn,
+              endpointDesc: "Bluetooth (\(centralID))",
+              rateLimiter: self.rateLimiter,
+              pairingStore: PairingStore.shared,
+              queue: DispatchQueue(label: "com.magicswitch.ble.incoming.\(centralID)"),
+              localIdentity: {
+                IntroducedIdentity(
+                  name: Host.current().localizedName ?? "Mac",
+                  port: 0
+                )
+              }
+            )
+            incoming.start()
+          }
         }
+        peripheral.respond(to: request, withResult: .success)
+        continue
       }
 
-      connection?.ingestIncomingData(data)
+      if data == MagicSwitchBLE.sessionEndMagic {
+        if let conn = connection {
+          Log.network.notice(
+            "BLETransportManager: tearing down server session for \(centralID) on sessionEndMagic"
+          )
+          conn.cancel()
+          activeServerConnections.removeValue(forKey: centralID)
+        }
+        peripheral.respond(to: request, withResult: .success)
+        continue
+      }
+
+      // Stream data for active session
+      if let conn = connection, conn.isConnected {
+        conn.ingestIncomingData(data)
+      } else {
+        Log.network.error(
+          "BLETransportManager: received write for \(centralID) with no active session"
+        )
+      }
       peripheral.respond(to: request, withResult: .success)
     }
   }
@@ -554,24 +590,11 @@ extension BLETransportManager: CBPeripheralDelegate {
       } else if let commandChar = commandChar,
         let pending = pendingClientConnects.removeValue(forKey: peripheral.identifier)
       {
-        if let old = self.activeClientConnections[peripheral.identifier] {
-          old.cancel()
-        }
-
-        let connection = BLETransportConnection(
+        establishClientConnection(
           peripheral: peripheral,
-          commandCharacteristic: commandChar,
-          queue: centralQueue
+          commandChar: commandChar,
+          completion: pending
         )
-        connection.onCancel = { [weak self] in
-          self?.centralQueue.async {
-            if self?.activeClientConnections[peripheral.identifier] === connection {
-              self?.activeClientConnections.removeValue(forKey: peripheral.identifier)
-            }
-          }
-        }
-        activeClientConnections[peripheral.identifier] = connection
-        pending(.success(connection))
       }
     }
 
@@ -613,24 +636,11 @@ extension BLETransportManager: CBPeripheralDelegate {
             $0.uuid == MagicSwitchBLE.commandCharacteristicUUID
           })
         {
-          if let old = self.activeClientConnections[peripheral.identifier] {
-            old.cancel()
-          }
-
-          let connection = BLETransportConnection(
+          establishClientConnection(
             peripheral: peripheral,
-            commandCharacteristic: commandChar,
-            queue: centralQueue
+            commandChar: commandChar,
+            completion: pending
           )
-          connection.onCancel = { [weak self] in
-            self?.centralQueue.async {
-              if self?.activeClientConnections[peripheral.identifier] === connection {
-                self?.activeClientConnections.removeValue(forKey: peripheral.identifier)
-              }
-            }
-          }
-          activeClientConnections[peripheral.identifier] = connection
-          pending(.success(connection))
         } else {
           pending(.failure(BLETransportError.characteristicNotFound))
         }

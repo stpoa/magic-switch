@@ -319,6 +319,9 @@ final class SecureChannel {
           self.lastReceivedCounter = counter
           completion(.success(plaintext))
         } catch {
+          Log.network.error(
+            "SecureChannel: decryption failed: \(error), frame len=\(frame.count), counter=\(counter), lastReceivedCounter=\(String(describing: self.lastReceivedCounter))"
+          )
           completion(.failure(.decryptionFailed))
         }
       }

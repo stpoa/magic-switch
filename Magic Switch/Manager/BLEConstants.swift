@@ -21,6 +21,12 @@ enum MagicSwitchBLE {
   /// Protocol version for Bluetooth transport.
   static let protocolVersion = 2
 
+  /// 4-byte control sequence sent by Central to initialize a new session on Peripheral.
+  static let sessionStartMagic = Data([0xFF, 0xFF, 0xFF, 0x01])
+
+  /// 4-byte control sequence sent by Central when tearing down a session.
+  static let sessionEndMagic = Data([0xFF, 0xFF, 0xFF, 0x02])
+
   /// Maximum chunk size for Bluetooth characteristic writes (safe default within standard BLE MTU).
   static let maxChunkSize = 500
 
