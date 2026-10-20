@@ -25,28 +25,131 @@ final class BLETransportManager: NSObject, ObservableObject {
 
   // Central (Client) state
   private var discoveredPeripherals: [UUID: CBPeripheral] = [:]
+  private var lastSeen: [UUID: Date] = [:]
   private var activeClientConnections: [UUID: BLETransportConnection] = [:]
   private var pendingClientConnects: [UUID: (Result<BLETransportConnection, Error>) -> Void] = [:]
+  private var discoveryTimer: DispatchSourceTimer?
 
   // MARK: - Lifecycle
 
   func start() {
-    centralManager = CBCentralManager(delegate: self, queue: centralQueue)
-    peripheralManager = CBPeripheralManager(delegate: self, queue: peripheralQueue)
+    centralQueue.async { [weak self] in
+      guard let self = self else { return }
+      if self.centralManager == nil {
+        self.centralManager = CBCentralManager(delegate: self, queue: self.centralQueue)
+      }
+    }
+    peripheralQueue.async { [weak self] in
+      guard let self = self else { return }
+      if self.peripheralManager == nil {
+        self.peripheralManager = CBPeripheralManager(delegate: self, queue: self.peripheralQueue)
+      }
+    }
+    startPeriodicDiscoveryTimer()
     Log.network.notice("BLETransportManager: started Bluetooth transport services")
   }
 
   func stop() {
-    centralManager?.stopScan()
-    peripheralManager?.stopAdvertising()
+    discoveryTimer?.cancel()
+    discoveryTimer = nil
+    centralQueue.async { [weak self] in
+      self?.centralManager?.stopScan()
+    }
+    peripheralQueue.async { [weak self] in
+      self?.peripheralManager?.stopAdvertising()
+    }
     Log.network.notice("BLETransportManager: stopped Bluetooth transport services")
+  }
+
+  /// Triggers a fresh scan and check for connected Bluetooth peers.
+  func refresh() {
+    centralQueue.async { [weak self] in
+      guard let self = self else { return }
+      Log.network.notice("BLETransportManager: refreshing Bluetooth discovery")
+      self.scanAndRetrievePeripherals()
+    }
+    peripheralQueue.async { [weak self] in
+      guard let self = self else { return }
+      self.ensureAdvertising()
+    }
+  }
+
+  private func startPeriodicDiscoveryTimer() {
+    centralQueue.async { [weak self] in
+      guard let self = self, self.discoveryTimer == nil else { return }
+      let timer = DispatchSource.makeTimerSource(queue: self.centralQueue)
+      timer.schedule(deadline: .now() + 2, repeating: 10.0)
+      timer.setEventHandler { [weak self] in
+        self?.scanAndRetrievePeripherals()
+        self?.ensureAdvertising()
+      }
+      timer.resume()
+      self.discoveryTimer = timer
+    }
+  }
+
+  private func ensureAdvertising() {
+    peripheralQueue.async { [weak self] in
+      guard let self = self,
+        let manager = self.peripheralManager,
+        manager.state == .poweredOn,
+        self.serviceAdded,
+        !manager.isAdvertising
+      else { return }
+      self.startAdvertising()
+    }
+  }
+
+  /// Scans for advertising peer Macs and checks for already-connected Bluetooth peers.
+  func scanAndRetrievePeripherals() {
+    centralQueue.async { [weak self] in
+      guard let self = self, let central = self.centralManager, central.state == .poweredOn else {
+        return
+      }
+
+      // 1. Retrieve already-connected peripherals that advertise/host our service
+      let connected = central.retrieveConnectedPeripherals(withServices: [MagicSwitchBLE.serviceUUID])
+      if !connected.isEmpty {
+        Log.network.notice(
+          "BLETransportManager: retrieveConnectedPeripherals found \(connected.count) peer(s)"
+        )
+        for peripheral in connected {
+          self.handleDiscoveredPeripheral(peripheral)
+        }
+      }
+
+      // 2. Start scanning for advertising peers
+      central.scanForPeripherals(
+        withServices: [MagicSwitchBLE.serviceUUID],
+        options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+      )
+    }
+  }
+
+  private func handleDiscoveredPeripheral(_ peripheral: CBPeripheral) {
+    discoveredPeripherals[peripheral.identifier] = peripheral
+    lastSeen[peripheral.identifier] = Date()
+    peripheral.delegate = self
+
+    if peripheral.state == .connected {
+      prepareConnectedPeripheral(peripheral)
+    } else if peripheral.state == .disconnected {
+      Log.network.notice(
+        "BLETransportManager: connecting to discovered peripheral '\(peripheral.name ?? "unnamed")' (\(peripheral.identifier))"
+      )
+      centralManager?.connect(peripheral, options: nil)
+    }
   }
 
   /// Checks whether a peer device is currently known and reachable over Bluetooth.
   func isPeerAvailable(identifier: UUID) -> Bool {
     centralQueue.sync {
       guard let p = discoveredPeripherals[identifier] else { return false }
-      return p.state == .connected || centralManager?.state == .poweredOn
+      if p.state == .connected { return true }
+      if let seen = lastSeen[identifier], Date().timeIntervalSince(seen) < 30 {
+        return true
+      }
+      return centralManager?.state == .poweredOn
     }
   }
 
@@ -64,6 +167,33 @@ final class BLETransportManager: NSObject, ObservableObject {
 
       guard let peripheral = self.discoveredPeripherals[peripheralIdentifier] else {
         completion(.failure(BLETransportError.characteristicNotFound))
+        return
+      }
+
+      // Check if we already have a ready, active connection
+      if let existing = self.activeClientConnections[peripheralIdentifier], existing.isConnected {
+        completion(.success(existing))
+        return
+      }
+
+      // Check if peripheral is connected and characteristics are ready and notifying
+      if peripheral.state == .connected,
+        let service = peripheral.services?.first(where: { $0.uuid == MagicSwitchBLE.serviceUUID }),
+        let commandChar = service.characteristics?.first(where: {
+          $0.uuid == MagicSwitchBLE.commandCharacteristicUUID
+        }),
+        let responseChar = service.characteristics?.first(where: {
+          $0.uuid == MagicSwitchBLE.responseCharacteristicUUID
+        }),
+        responseChar.isNotifying
+      {
+        let connection = BLETransportConnection(
+          peripheral: peripheral,
+          commandCharacteristic: commandChar,
+          queue: self.centralQueue
+        )
+        self.activeClientConnections[peripheralIdentifier] = connection
+        completion(.success(connection))
         return
       }
 
@@ -87,7 +217,22 @@ final class BLETransportManager: NSObject, ObservableObject {
 
   private func prepareConnectedPeripheral(_ peripheral: CBPeripheral) {
     peripheral.delegate = self
-    peripheral.discoverServices([MagicSwitchBLE.serviceUUID])
+    if let service = peripheral.services?.first(where: { $0.uuid == MagicSwitchBLE.serviceUUID }) {
+      if service.characteristics != nil {
+        self.peripheral(peripheral, didDiscoverCharacteristicsFor: service, error: nil)
+      } else {
+        peripheral.discoverCharacteristics(
+          [
+            MagicSwitchBLE.commandCharacteristicUUID,
+            MagicSwitchBLE.responseCharacteristicUUID,
+            MagicSwitchBLE.metadataCharacteristicUUID,
+          ],
+          for: service
+        )
+      }
+    } else {
+      peripheral.discoverServices([MagicSwitchBLE.serviceUUID])
+    }
   }
 }
 
@@ -146,13 +291,16 @@ extension BLETransportManager: CBPeripheralManagerDelegate {
 
   private func startAdvertising() {
     guard let manager = peripheralManager, manager.state == .poweredOn else { return }
-    let name = Host.current().localizedName ?? "Mac"
     let advertisementData: [String: Any] = [
-      CBAdvertisementDataServiceUUIDsKey: [MagicSwitchBLE.serviceUUID],
-      CBAdvertisementDataLocalNameKey: name,
+      CBAdvertisementDataServiceUUIDsKey: [MagicSwitchBLE.serviceUUID]
     ]
+    if manager.isAdvertising {
+      manager.stopAdvertising()
+    }
     manager.startAdvertising(advertisementData)
-    Log.network.notice("BLETransportManager: advertising Magic Switch service as '\(name)'")
+    Log.network.notice(
+      "BLETransportManager: advertising Magic Switch service UUID '\(MagicSwitchBLE.serviceUUID)'"
+    )
   }
 
   func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
@@ -196,7 +344,9 @@ extension BLETransportManager: CBPeripheralManagerDelegate {
       let centralID = request.central.identifier
       var connection = activeServerConnections[centralID]
 
-      if connection == nil, let responseChar = responseCharacteristic {
+      if connection == nil || connection?.isConnected == false,
+        let responseChar = responseCharacteristic
+      {
         // Create new incoming connection session
         let newConn = BLETransportConnection(
           central: request.central,
@@ -231,18 +381,38 @@ extension BLETransportManager: CBPeripheralManagerDelegate {
       peripheral.respond(to: request, withResult: .success)
     }
   }
+
+  func peripheralManager(
+    _ peripheral: CBPeripheralManager,
+    central: CBCentral,
+    didSubscribeTo characteristic: CBCharacteristic
+  ) {
+    Log.network.notice(
+      "BLETransportManager: central \(central.identifier) subscribed to \(characteristic.uuid)"
+    )
+  }
+
+  func peripheralManager(
+    _ peripheral: CBPeripheralManager,
+    central: CBCentral,
+    didUnsubscribeFrom characteristic: CBCharacteristic
+  ) {
+    Log.network.notice(
+      "BLETransportManager: central \(central.identifier) unsubscribed from \(characteristic.uuid)"
+    )
+    activeServerConnections.removeValue(forKey: central.identifier)
+  }
 }
 
 // MARK: - CBCentralManagerDelegate (Client / Central Role)
 
 extension BLETransportManager: CBCentralManagerDelegate {
   func centralManagerDidUpdateState(_ central: CBCentralManager) {
-    guard central.state == .poweredOn else { return }
-    central.scanForPeripherals(
-      withServices: [MagicSwitchBLE.serviceUUID],
-      options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+    Log.network.notice(
+      "BLETransportManager: central manager state updated: \(central.state.rawValue)"
     )
-    Log.network.notice("BLETransportManager: scanning for peer Macs over BLE")
+    guard central.state == .poweredOn else { return }
+    scanAndRetrievePeripherals()
   }
 
   func centralManager(
@@ -251,13 +421,16 @@ extension BLETransportManager: CBCentralManagerDelegate {
     advertisementData: [String: Any],
     rssi RSSI: NSNumber
   ) {
-    discoveredPeripherals[peripheral.identifier] = peripheral
-    peripheral.delegate = self
-    // Connect to read metadata and identify the peer
-    central.connect(peripheral, options: nil)
+    Log.network.notice(
+      "BLETransportManager: didDiscover peripheral '\(peripheral.name ?? "unnamed")' (\(peripheral.identifier)), rssi: \(RSSI)"
+    )
+    handleDiscoveredPeripheral(peripheral)
   }
 
   func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+    Log.network.notice(
+      "BLETransportManager: central connected to peripheral '\(peripheral.name ?? "unnamed")' (\(peripheral.identifier))"
+    )
     prepareConnectedPeripheral(peripheral)
   }
 
@@ -266,6 +439,9 @@ extension BLETransportManager: CBCentralManagerDelegate {
     didFailToConnect peripheral: CBPeripheral,
     error: Error?
   ) {
+    Log.network.error(
+      "BLETransportManager: failed to connect to peripheral \(peripheral.identifier): \(String(describing: error))"
+    )
     if let pending = pendingClientConnects.removeValue(forKey: peripheral.identifier) {
       pending(.failure(error ?? BLETransportError.notConnected))
     }
@@ -276,6 +452,9 @@ extension BLETransportManager: CBCentralManagerDelegate {
     didDisconnectPeripheral peripheral: CBPeripheral,
     error: Error?
   ) {
+    Log.network.notice(
+      "BLETransportManager: disconnected from peripheral \(peripheral.identifier): \(String(describing: error))"
+    )
     if let conn = activeClientConnections.removeValue(forKey: peripheral.identifier) {
       conn.cancel()
     }
@@ -289,7 +468,14 @@ extension BLETransportManager: CBCentralManagerDelegate {
 
 extension BLETransportManager: CBPeripheralDelegate {
   func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+    if let error = error {
+      Log.network.error("BLETransportManager: didDiscoverServices error: \(error)")
+      return
+    }
     guard let services = peripheral.services else { return }
+    Log.network.notice(
+      "BLETransportManager: discovered \(services.count) service(s) for \(peripheral.identifier)"
+    )
     for service in services where service.uuid == MagicSwitchBLE.serviceUUID {
       peripheral.discoverCharacteristics(
         [
@@ -307,7 +493,14 @@ extension BLETransportManager: CBPeripheralDelegate {
     didDiscoverCharacteristicsFor service: CBService,
     error: Error?
   ) {
+    if let error = error {
+      Log.network.error("BLETransportManager: didDiscoverCharacteristics error: \(error)")
+      return
+    }
     guard let characteristics = service.characteristics else { return }
+    Log.network.notice(
+      "BLETransportManager: discovered \(characteristics.count) characteristic(s) for \(peripheral.identifier)"
+    )
 
     var commandChar: CBCharacteristic?
     var responseChar: CBCharacteristic?
@@ -322,27 +515,70 @@ extension BLETransportManager: CBPeripheralDelegate {
       }
     }
 
-    // Subscribe to responses
+    // Subscribe to responses if not already notifying
     if let responseChar = responseChar {
-      peripheral.setNotifyValue(true, for: responseChar)
+      if !responseChar.isNotifying {
+        peripheral.setNotifyValue(true, for: responseChar)
+      } else if let commandChar = commandChar,
+        let pending = pendingClientConnects.removeValue(forKey: peripheral.identifier)
+      {
+        let connection = BLETransportConnection(
+          peripheral: peripheral,
+          commandCharacteristic: commandChar,
+          queue: centralQueue
+        )
+        activeClientConnections[peripheral.identifier] = connection
+        pending(.success(connection))
+      }
     }
 
     // Read peer metadata to register in NetworkDeviceStore
     if let metadataChar = metadataChar {
       peripheral.readValue(for: metadataChar)
     }
+  }
 
-    // If an outgoing connection is waiting for this peripheral to be ready
-    if let commandChar = commandChar,
-      let pending = pendingClientConnects.removeValue(forKey: peripheral.identifier)
-    {
-      let connection = BLETransportConnection(
-        peripheral: peripheral,
-        commandCharacteristic: commandChar,
-        queue: centralQueue
+  func peripheral(
+    _ peripheral: CBPeripheral,
+    didUpdateNotificationStateFor characteristic: CBCharacteristic,
+    error: Error?
+  ) {
+    if let error = error {
+      Log.network.error(
+        "BLETransportManager: didUpdateNotificationStateFor error for \(characteristic.uuid): \(error)"
       )
-      activeClientConnections[peripheral.identifier] = connection
-      pending(.success(connection))
+      if let pending = pendingClientConnects.removeValue(forKey: peripheral.identifier) {
+        pending(.failure(error))
+      }
+      return
+    }
+
+    Log.network.notice(
+      "BLETransportManager: notification state for \(characteristic.uuid) is now \(characteristic.isNotifying)"
+    )
+
+    if characteristic.uuid == MagicSwitchBLE.responseCharacteristicUUID
+      && characteristic.isNotifying
+    {
+      if let pending = pendingClientConnects.removeValue(forKey: peripheral.identifier) {
+        if let service = peripheral.services?.first(where: {
+          $0.uuid == MagicSwitchBLE.serviceUUID
+        }),
+          let commandChar = service.characteristics?.first(where: {
+            $0.uuid == MagicSwitchBLE.commandCharacteristicUUID
+          })
+        {
+          let connection = BLETransportConnection(
+            peripheral: peripheral,
+            commandCharacteristic: commandChar,
+            queue: centralQueue
+          )
+          activeClientConnections[peripheral.identifier] = connection
+          pending(.success(connection))
+        } else {
+          pending(.failure(BLETransportError.characteristicNotFound))
+        }
+      }
     }
   }
 
@@ -351,12 +587,20 @@ extension BLETransportManager: CBPeripheralDelegate {
     didUpdateValueFor characteristic: CBCharacteristic,
     error: Error?
   ) {
-    guard error == nil, let data = characteristic.value else { return }
+    guard error == nil, let data = characteristic.value else {
+      if let error = error {
+        Log.network.error("BLETransportManager: didUpdateValueFor error: \(error)")
+      }
+      return
+    }
 
     if characteristic.uuid == MagicSwitchBLE.metadataCharacteristicUUID {
       // Decode and register peer in NetworkDeviceStore
       do {
         let metadata = try JSONDecoder().decode(BLEPeerMetadata.self, from: data)
+        Log.network.notice(
+          "BLETransportManager: received peer metadata: name='\(metadata.name)', fingerprint=\(metadata.fingerprint ?? "nil")"
+        )
         DispatchQueue.main.async {
           NetworkDeviceStore.shared.registerDiscoveredBluetoothPeer(
             identifier: peripheral.identifier,

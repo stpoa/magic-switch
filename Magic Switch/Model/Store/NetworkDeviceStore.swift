@@ -119,8 +119,12 @@ final class NetworkDeviceStore: ObservableObject, NetworkDeviceManageable {
     // (renamed). The address we resolve for our own advertised service is
     // always one of this machine's interface addresses; a peer's never is.
     let localHosts = Self.localAddresses()
+    let localName = Host.current().localizedName ?? ""
     return discoveredNetworkDevices.filter { discovered in
-      let isNotSelf = !localHosts.contains(Self.normalizeHost(discovered.host))
+      let isNotSelf =
+        !localHosts.contains(Self.normalizeHost(discovered.host))
+        && (discovered.host.isEmpty
+          ? discovered.name.caseInsensitiveCompare(localName) != .orderedSame : true)
       let isNotRegistered = !networkDevices.contains(where: { $0.id == discovered.id })
       return isNotSelf && isNotRegistered
     }
@@ -173,6 +177,11 @@ final class NetworkDeviceStore: ObservableObject, NetworkDeviceManageable {
     name: String,
     fingerprint: String?
   ) {
+    let localName = Host.current().localizedName ?? "Mac"
+    if name.caseInsensitiveCompare(localName) == .orderedSame {
+      return
+    }
+
     // 1. If we already have a registered device with this name or fingerprint, associate it
     if let index = networkDevices.firstIndex(where: {
       $0.name.caseInsensitiveCompare(name) == .orderedSame
@@ -549,6 +558,7 @@ final class NetworkDeviceStore: ObservableObject, NetworkDeviceManageable {
   func refreshDiscovery() {
     discoveredNetworkDevices = []
     serviceBrowser.refresh()
+    BLETransportManager.shared.refresh()
     // Introduced entries only repopulate via an exchange; kick one now.
     pollReachability()
   }
@@ -722,6 +732,9 @@ final class NetworkDeviceStore: ObservableObject, NetworkDeviceManageable {
     where discoveredNetworkDevices[index].isActive
       && discoveredNetworkDevices[index].lastUpdated < cutoff
       && !serviceBrowser.isCurrentlyBrowsed(discoveredNetworkDevices[index].id)
+      && (discoveredNetworkDevices[index].bluetoothID == nil
+        || !BLETransportManager.shared.isPeerAvailable(
+          identifier: discoveredNetworkDevices[index].bluetoothID!))
     {
       discoveredNetworkDevices[index].isActive = false
     }

@@ -298,6 +298,9 @@ final class OutgoingConnection {
         if case .posix(let code) = error, code == .ECONNREFUSED {
           Log.network.error("OutgoingConnection refused: \(error)")
           completion(.failure(.connectionFailed(error.localizedDescription)))
+        } else if case .dns = error {
+          Log.network.error("OutgoingConnection DNS error: \(error)")
+          completion(.failure(.connectionFailed(error.localizedDescription)))
         }
       case .cancelled:
         break

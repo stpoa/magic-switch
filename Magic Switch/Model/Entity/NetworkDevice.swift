@@ -108,8 +108,10 @@ struct NetworkDevice: Identifiable, Codable {
       }
       // Fingerprint matches the pin — a trusted update.
       pendingFingerprint = nil
-      host = device.host
-      port = device.port
+      if !device.host.isEmpty {
+        host = device.host
+        port = device.port
+      }
       if let btID = device.bluetoothID { bluetoothID = btID }
       lastUpdated = Date()
       isActive = device.isActive
@@ -122,8 +124,10 @@ struct NetworkDevice: Identifiable, Codable {
       fingerprint = incoming
     }
     pendingFingerprint = nil
-    host = device.host
-    port = device.port
+    if !device.host.isEmpty {
+      host = device.host
+      port = device.port
+    }
     if let btID = device.bluetoothID { bluetoothID = btID }
     lastUpdated = Date()
     isActive = device.isActive
