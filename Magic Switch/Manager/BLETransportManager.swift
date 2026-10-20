@@ -400,6 +400,14 @@ extension BLETransportManager: CBPeripheralManagerDelegate {
     Log.network.notice(
       "BLETransportManager: central \(central.identifier) subscribed to \(characteristic.uuid)"
     )
+    activeServerConnections[central.identifier]?.handlePeripheralReady()
+  }
+
+  func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+    Log.network.notice("BLETransportManager: peripheral manager is ready to update subscribers")
+    for connection in activeServerConnections.values {
+      connection.handlePeripheralReady()
+    }
   }
 
   func peripheralManager(

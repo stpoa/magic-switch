@@ -186,37 +186,63 @@ final class BLETransportConnection: NSObject, TransportConnection {
     characteristic: CBMutableCharacteristic,
     completion: @escaping (Error?) -> Void
   ) {
-    let limit = central.maximumUpdateValueLength
-    let maxChunk = (limit > 0) ? min(limit, 500) : 20
+    // BLE ATT baseline MTU payload limit is 20 bytes (23 ATT MTU - 3 byte header).
+    // Characteristic notifications without MTU exchange fail in CoreBluetooth if chunk > 20.
+    let maxChunk = 20
+    var chunks: [Data] = []
     var offset = 0
-    var success = true
-
     while offset < data.count {
       let length = min(maxChunk, data.count - offset)
-      let chunk = data.subdata(in: offset..<(offset + length))
-      var didSend = false
-      // Subscription negotiation or transmit queue drain can take 20-200ms; retry up to 30 times (1.5s total)
-      for _ in 0..<30 {
-        if manager.updateValue(chunk, for: characteristic, onSubscribedCentrals: nil) {
-          didSend = true
-          break
-        }
-        usleep(30_000)  // 30ms (standard BLE connection interval range)
-      }
-      if !didSend {
-        Log.network.error(
-          "sendAsPeripheral: updateValue failed for chunk of \(length) bytes (maxChunk=\(maxChunk), limit=\(limit), subscribed=\(characteristic.subscribedCentrals?.count ?? 0))"
-        )
-        success = false
-        break
-      }
+      chunks.append(data.subdata(in: offset..<(offset + length)))
       offset += length
     }
 
-    if success {
-      completion(nil)
-    } else {
-      completion(BLETransportError.writeFailed("Peripheral transmit buffer overflow"))
+    self.pendingChunks = chunks
+    self.sendCompletion = completion
+    self.sendNextPeripheralChunk()
+  }
+
+  func sendNextPeripheralChunk() {
+    queue.async {
+      guard !self.isCancelled else {
+        let comp = self.sendCompletion
+        self.sendCompletion = nil
+        self.pendingChunks.removeAll()
+        comp?(BLETransportError.disconnected)
+        return
+      }
+
+      guard let manager = self.peripheralManager, let char = self.responseCharacteristic else {
+        let comp = self.sendCompletion
+        self.sendCompletion = nil
+        self.pendingChunks.removeAll()
+        comp?(BLETransportError.notConnected)
+        return
+      }
+
+      while !self.pendingChunks.isEmpty {
+        let chunk = self.pendingChunks[0]
+        let sent = manager.updateValue(chunk, for: char, onSubscribedCentrals: nil)
+        if sent {
+          self.pendingChunks.removeFirst()
+        } else {
+          // Transmit buffer full or central subscription still pending.
+          // Retry automatically after a short interval or when peripheralManagerIsReady fires.
+          self.queue.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+            self?.sendNextPeripheralChunk()
+          }
+          return
+        }
+      }
+
+      let comp = self.sendCompletion
+      self.sendCompletion = nil
+      comp?(nil)
     }
+  }
+
+  /// Called when the peripheral manager's transmit queue has freed up.
+  func handlePeripheralReady() {
+    sendNextPeripheralChunk()
   }
 }
