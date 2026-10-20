@@ -32,6 +32,9 @@ final class BLETransportConnection: NSObject, TransportConnection {
   private var sendCompletion: ((Error?) -> Void)?
   private var pendingChunks: [Data] = []
 
+  /// Invoked when the transport connection is cancelled and torn down.
+  var onCancel: (() -> Void)?
+
   var isConnected: Bool {
     if isCancelled { return false }
     if let peripheral = peripheral {
@@ -114,6 +117,7 @@ final class BLETransportConnection: NSObject, TransportConnection {
         self.sendCompletion = nil
         sendComp(BLETransportError.disconnected)
       }
+      self.onCancel?()
     }
   }
 

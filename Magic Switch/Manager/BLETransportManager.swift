@@ -192,6 +192,11 @@ final class BLETransportManager: NSObject, ObservableObject {
           commandCharacteristic: commandChar,
           queue: self.centralQueue
         )
+        connection.onCancel = { [weak self] in
+          self?.centralQueue.async {
+            self?.activeClientConnections.removeValue(forKey: peripheralIdentifier)
+          }
+        }
         self.activeClientConnections[peripheralIdentifier] = connection
         completion(.success(connection))
         return
@@ -354,6 +359,11 @@ extension BLETransportManager: CBPeripheralManagerDelegate {
           responseCharacteristic: responseChar,
           queue: peripheralQueue
         )
+        newConn.onCancel = { [weak self] in
+          self?.peripheralQueue.async {
+            self?.activeServerConnections.removeValue(forKey: centralID)
+          }
+        }
         activeServerConnections[centralID] = newConn
         connection = newConn
 
@@ -527,6 +537,11 @@ extension BLETransportManager: CBPeripheralDelegate {
           commandCharacteristic: commandChar,
           queue: centralQueue
         )
+        connection.onCancel = { [weak self] in
+          self?.centralQueue.async {
+            self?.activeClientConnections.removeValue(forKey: peripheral.identifier)
+          }
+        }
         activeClientConnections[peripheral.identifier] = connection
         pending(.success(connection))
       }
@@ -573,6 +588,11 @@ extension BLETransportManager: CBPeripheralDelegate {
             commandCharacteristic: commandChar,
             queue: centralQueue
           )
+          connection.onCancel = { [weak self] in
+            self?.centralQueue.async {
+              self?.activeClientConnections.removeValue(forKey: peripheral.identifier)
+            }
+          }
           activeClientConnections[peripheral.identifier] = connection
           pending(.success(connection))
         } else {
