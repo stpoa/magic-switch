@@ -189,16 +189,18 @@ final class BLETransportConnection: NSObject, TransportConnection {
     while offset < data.count {
       let length = min(maxChunk, data.count - offset)
       let chunk = data.subdata(in: offset..<(offset + length))
-      let didSend = manager.updateValue(chunk, for: characteristic, onSubscribedCentrals: nil)
-      if !didSend {
-        // If the transmit queue is full, yield a small slice then retry
-        usleep(5000)  // 5ms
-        let retrySend = manager.updateValue(
-          chunk, for: characteristic, onSubscribedCentrals: nil)
-        if !retrySend {
-          success = false
+      var didSend = false
+      // Subscription negotiation or transmit queue drain can take 20-200ms; retry up to 20 times (1s total)
+      for _ in 0..<20 {
+        if manager.updateValue(chunk, for: characteristic, onSubscribedCentrals: nil) {
+          didSend = true
           break
         }
+        usleep(50_000)  // 50ms
+      }
+      if !didSend {
+        success = false
+        break
       }
       offset += length
     }
