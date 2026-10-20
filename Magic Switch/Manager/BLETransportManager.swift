@@ -263,7 +263,7 @@ extension BLETransportManager: CBPeripheralManagerDelegate {
       type: MagicSwitchBLE.responseCharacteristicUUID,
       properties: [.notify],
       value: nil,
-      permissions: [.readable]
+      permissions: []
     )
     self.responseCharacteristic = responseChar
 

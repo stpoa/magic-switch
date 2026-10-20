@@ -125,8 +125,8 @@ final class BLETransportConnection: NSObject, TransportConnection {
     characteristic: CBCharacteristic,
     completion: @escaping (Error?) -> Void
   ) {
-    let maxChunk = max(
-      20, min(MagicSwitchBLE.maxChunkSize, peripheral.maximumWriteValueLength(for: .withResponse)))
+    let limit = peripheral.maximumWriteValueLength(for: .withResponse)
+    let maxChunk = (limit > 0) ? min(limit, 500) : 20
     var chunks: [Data] = []
     var offset = 0
     while offset < data.count {
@@ -182,7 +182,8 @@ final class BLETransportConnection: NSObject, TransportConnection {
     characteristic: CBMutableCharacteristic,
     completion: @escaping (Error?) -> Void
   ) {
-    let maxChunk = MagicSwitchBLE.maxChunkSize
+    let limit = central.maximumUpdateValueLength
+    let maxChunk = (limit > 0) ? min(limit, 500) : 20
     var offset = 0
     var success = true
 
@@ -190,15 +191,18 @@ final class BLETransportConnection: NSObject, TransportConnection {
       let length = min(maxChunk, data.count - offset)
       let chunk = data.subdata(in: offset..<(offset + length))
       var didSend = false
-      // Subscription negotiation or transmit queue drain can take 20-200ms; retry up to 20 times (1s total)
-      for _ in 0..<20 {
+      // Subscription negotiation or transmit queue drain can take 20-200ms; retry up to 30 times (1.5s total)
+      for _ in 0..<30 {
         if manager.updateValue(chunk, for: characteristic, onSubscribedCentrals: nil) {
           didSend = true
           break
         }
-        usleep(50_000)  // 50ms
+        usleep(30_000)  // 30ms (standard BLE connection interval range)
       }
       if !didSend {
+        Log.network.error(
+          "sendAsPeripheral: updateValue failed for chunk of \(length) bytes (maxChunk=\(maxChunk), limit=\(limit), subscribed=\(characteristic.subscribedCentrals?.count ?? 0))"
+        )
         success = false
         break
       }
